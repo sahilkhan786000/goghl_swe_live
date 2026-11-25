@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BillingPanel } from './BillingPanel';
+import { NotesPanel } from './NotesPanel';
 import './App.css';
 
 type Workspace = { id: string; role: 'admin' | 'agent' };
@@ -17,6 +19,14 @@ type Conversation = {
   latestMessage: Message | null;
 };
 type ConversationDetail = { conversation: Conversation; messages: Message[] };
+type SearchResult = {
+  id: string;
+  contact: string;
+  direction: Message['direction'];
+  text: string;
+  createdAt: string;
+  state: Conversation['state'];
+};
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -110,6 +120,13 @@ export function App() {
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [mobileConversation, setMobileConversation] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchActive, setSearchActive] = useState(false);
+  const [searchBusy, setSearchBusy] = useState(false);
+  const [searchError, setSearchError] = useState('');
+  const pendingSelection = useRef<string | undefined>(undefined);
   const revision = useRealtime(workspace);
   const currentWorkspace = useMemo(
     () => user?.workspaces.find((membership) => membership.id === workspace),
@@ -143,15 +160,40 @@ export function App() {
       );
       setConversations(result.items);
       setError('');
-      setSelectedContact((current) =>
-        current && result.items.some((item) => item.contact === current)
+      setSelectedContact((current) => {
+        const pending = pendingSelection.current;
+        pendingSelection.current = undefined;
+        return pending || (current && result.items.some((item) => item.contact === current)
           ? current
-          : result.items[0]?.contact,
-      );
+          : result.items[0]?.contact);
+      });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Could not load inbox');
     }
   }, [workspace, filter]);
+
+  const runSearch = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const query = searchText.trim();
+    if (!workspace || query.length < 2) {
+      setSearchError('Enter at least 2 characters to search.');
+      return;
+    }
+    setSearchBusy(true);
+    setSearchError('');
+    setSearchActive(true);
+    try {
+      const result = await request<{ items: SearchResult[] }>(
+        `/api/search?workspace=${encodeURIComponent(workspace)}&q=${encodeURIComponent(query)}`,
+      );
+      setSearchResults(result.items);
+    } catch (reason) {
+      setSearchResults([]);
+      setSearchError(reason instanceof Error ? reason.message : 'Search is unavailable');
+    } finally {
+      setSearchBusy(false);
+    }
+  };
 
   useEffect(() => {
     void loadConversations();
@@ -254,7 +296,7 @@ export function App() {
   }
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${mobileConversation ? 'mobile-detail' : ''}`}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark small">S</div>
@@ -267,6 +309,7 @@ export function App() {
           onChange={(event) => {
             setWorkspace(event.target.value);
             setSelectedContact(undefined);
+            setMobileConversation(false);
           }}
         >
           {user.workspaces.map((item) => (
@@ -274,13 +317,24 @@ export function App() {
           ))}
         </select>
         <p className="nav-heading">INBOX</p>
-        <button className={`nav-item ${filter === 'open' ? 'active' : ''}`} onClick={() => setFilter('open')}>
-          <span className="nav-icon">▤</span> Open conversations
+        <button className={`nav-item ${filter === 'open' ? 'active' : ''}`} onClick={() => {
+          setFilter('open');
+          setMobileConversation(false);
+          setSearchActive(false);
+        }}>
+          <span className="nav-icon">▤</span><span className="nav-label">Open conversations</span>
           <span className="nav-count">{conversations.length}</span>
         </button>
-        <button className={`nav-item ${filter === 'closed' ? 'active' : ''}`} onClick={() => setFilter('closed')}>
-          <span className="nav-icon">✓</span> Closed
+        <button className={`nav-item ${filter === 'closed' ? 'active' : ''}`} onClick={() => {
+          setFilter('closed');
+          setMobileConversation(false);
+          setSearchActive(false);
+        }}>
+          <span className="nav-icon">✓</span><span className="nav-label">Closed</span>
         </button>
+        {workspace && currentWorkspace?.role === 'admin' && (
+          <BillingPanel key={workspace} workspace={workspace} name={user.name} email={user.email} />
+        )}
         <div className="sidebar-bottom">
           <div className="user-card">
             <div className="avatar">{(user.name || user.sub).slice(0, 1).toUpperCase()}</div>
@@ -301,8 +355,51 @@ export function App() {
           </div>
           <button className="icon-button refresh-button" aria-label="Refresh inbox" onClick={() => void loadConversations()}>↻</button>
         </header>
+        <form className="search-form" onSubmit={(event) => void runSearch(event)}>
+          <input
+            aria-label="Search messages"
+            placeholder="Search messages or contacts"
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            maxLength={120}
+          />
+          <button type="submit" disabled={searchBusy}>{searchBusy ? '…' : 'Search'}</button>
+          {searchActive && <button type="button" onClick={() => {
+            setSearchActive(false);
+            setSearchText('');
+            setSearchError('');
+          }}>Clear</button>}
+        </form>
+        {searchError && <p className="search-error" role="alert">{searchError}</p>}
         <div className="conversation-list">
-          {conversations.length === 0 ? (
+          {searchActive ? searchResults.length === 0 ? (
+            <div className="empty-list">
+              <strong>{searchBusy ? 'Searching…' : 'No matching messages'}</strong>
+              <span>Results are limited to this workspace.</span>
+            </div>
+          ) : searchResults.map((result) => (
+            <button
+              key={result.id}
+              className="conversation-row search-result"
+              onClick={() => {
+                pendingSelection.current = result.contact;
+                setFilter(result.state);
+                setSearchActive(false);
+                setSelectedContact(result.contact);
+                setMobileConversation(true);
+              }}
+            >
+              <div className="avatar contact-avatar">{result.contact.slice(-2)}</div>
+              <div className="conversation-copy">
+                <div className="conversation-topline">
+                  <strong>{result.contact}</strong>
+                  <time>{formatTime(result.createdAt)}</time>
+                </div>
+                <p>{result.text}</p>
+                <span className="assignee-label">{result.direction} · {result.state}</span>
+              </div>
+            </button>
+          )) : conversations.length === 0 ? (
             <div className="empty-list">
               <div className="empty-icon">✳</div>
               <strong>All caught up</strong>
@@ -312,7 +409,10 @@ export function App() {
             <button
               key={conversation.contact}
               className={`conversation-row ${selectedContact === conversation.contact ? 'selected' : ''}`}
-              onClick={() => setSelectedContact(conversation.contact)}
+              onClick={() => {
+                setSelectedContact(conversation.contact);
+                setMobileConversation(true);
+              }}
             >
               <div className="avatar contact-avatar">{conversation.contact.slice(-2)}</div>
               <div className="conversation-copy">
@@ -335,6 +435,9 @@ export function App() {
           <>
             <header className="chat-header">
               <div className="contact-heading">
+                <button className="mobile-back secondary-button" onClick={() => setMobileConversation(false)}>
+                  Back to inbox
+                </button>
                 <div className="avatar contact-avatar large-avatar">{detail.conversation.contact.slice(-2)}</div>
                 <div>
                   <h2>{detail.conversation.contact}</h2>
@@ -372,6 +475,10 @@ export function App() {
                 </article>
               ))}
             </div>
+            {workspace && (
+              <NotesPanel key={`${workspace}:${detail.conversation.contact}`} workspace={workspace}
+                contact={detail.conversation.contact} userId={user.sub} />
+            )}
             {error && <div className="inline-error" role="alert">{error}</div>}
             <form className="composer" onSubmit={(event) => void sendReply(event)}>
               <textarea

@@ -79,3 +79,46 @@ export interface WebhookRecord {
   leaseUntil?: Date;
   attempts: number;
 }
+
+export type BillingStatus = 'none' | 'incomplete' | 'active' | 'past_due' | 'canceled';
+
+export interface WorkspaceBilling {
+  workspace: string;
+  customerId?: string;
+  subscriptionId?: string;
+  status: Exclude<BillingStatus, 'none'>;
+  seats: number;
+  canSend: boolean;
+  actionUrl?: string;
+  tokenFingerprint?: string;
+  updatedAt: Date;
+}
+
+export interface NotePublicKey {
+  kty: 'RSA';
+  n: string;
+  e: string;
+  alg: 'RSA-OAEP-256';
+  ext: true;
+  key_ops: ['encrypt'];
+}
+
+export interface WorkspaceNoteKey {
+  workspace: string;
+  userId: string;
+  deviceId: string;
+  keyId: string;
+  publicKey: NotePublicKey;
+  updatedAt: Date;
+}
+
+export interface EncryptedPrivateNote {
+  id: string;
+  workspace: string;
+  contact: string;
+  author: string;
+  iv: string;
+  ciphertext: string;
+  wrappedKeys: Record<string, string>;
+  createdAt: Date;
+}

@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import express, { type ErrorRequestHandler, type Request, type Response } from 'express';
 import { config } from './config.js';
@@ -6,6 +6,10 @@ import { beginLogin, finishLogin, getSession, logout, workspaceRole } from './au
 import { ensureIndexes, getCollections, isDuplicateKey, resetApplicationData, pingStores, appendWorkspaceEvent, publishWorkspaceEvent } from './store.js';
 import { startRealtime } from './realtime.js';
 import { queueMessage, startWorkers } from './workers.js';
+import { BillingError, changeSeats, getBilling, handlePayboxEvent, refreshBilling, subscribeWorkspace } from './billing.js';
+import { verifyWebhookSignature } from './signatures.js';
+import { resetSearchIndex, SearchUnavailableError, searchMessages } from './search.js';
+import { listEncryptedNotes, listNoteKeys, NoteInputError, registerNoteKey, saveEncryptedNote } from './notes.js';
 import type { Conversation, PigeonEvent, StoredMessage, UserSession } from './types.js';
 
 const WORKSPACES = ['ws_acme', 'ws_globex'] as const;
@@ -39,20 +43,6 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
-function signatureIsValid(header: string | undefined, raw: Buffer): boolean {
-  if (!header) return false;
-  const match = /^t=(\d{1,12}),v1=([a-f0-9]{64})$/i.exec(header);
-  if (!match) return false;
-  const timestamp = Number(match[1]);
-  if (!Number.isSafeInteger(timestamp) || Math.abs(Date.now() / 1000 - timestamp) > 300) return false;
-  const expected = createHmac('sha256', config.pigeon.webhookSecret)
-    .update(`${match[1]}.`)
-    .update(raw)
-    .digest();
-  const provided = Buffer.from(match[2], 'hex');
-  return provided.length === expected.length && timingSafeEqual(provided, expected);
-}
-
 async function authenticatedSession(request: Request, response: Response): Promise<UserSession | null> {
   const session = await getSession(request);
   if (!session) response.status(401).json({ error: 'authentication_required' });
@@ -62,6 +52,13 @@ async function authenticatedSession(request: Request, response: Response): Promi
 function requireWorkspace(session: UserSession, workspace: unknown): asserts workspace is string {
   if (typeof workspace !== 'string' || !workspace) throw new HttpError(400, 'workspace is required');
   if (!workspaceRole(session, workspace)) throw new HttpError(403, 'workspace access denied');
+}
+
+function requireWorkspaceAdmin(session: UserSession, workspace: unknown): asserts workspace is string {
+  requireWorkspace(session, workspace);
+  if (workspaceRole(session, workspace)?.role !== 'admin') {
+    throw new HttpError(403, 'workspace admin access required');
+  }
 }
 
 async function claimConversation(
@@ -172,7 +169,7 @@ app.post(
   express.raw({ type: '*/*', limit: '1mb' }),
   asyncRoute(async (request, response) => {
     const raw = Buffer.isBuffer(request.body) ? request.body : Buffer.alloc(0);
-    if (!signatureIsValid(request.header('x-pigeon-signature'), raw)) {
+    if (!verifyWebhookSignature(request.header('x-pigeon-signature'), raw, config.pigeon.webhookSecret)) {
       response.status(401).json({ error: 'invalid_signature' });
       return;
     }
@@ -239,6 +236,41 @@ app.post(
   }),
 );
 
+app.post(
+  '/webhooks/paybox',
+  express.raw({ type: '*/*', limit: '1mb' }),
+  asyncRoute(async (request, response) => {
+    const raw = Buffer.isBuffer(request.body) ? request.body : Buffer.alloc(0);
+    if (!verifyWebhookSignature(request.header('x-paybox-signature'), raw, config.paybox.webhookSecret)) {
+      response.status(401).json({ error: 'invalid_signature' });
+      return;
+    }
+
+    let event: { id?: unknown; type?: unknown; data?: { object?: Record<string, unknown> } };
+    try {
+      event = JSON.parse(raw.toString('utf8')) as typeof event;
+    } catch {
+      response.status(400).json({ error: 'invalid_json' });
+      return;
+    }
+    if (typeof event.id !== 'string' || typeof event.type !== 'string') {
+      response.status(400).json({ error: 'invalid_event' });
+      return;
+    }
+    if (
+      event.type === 'customer.subscription.created' ||
+      event.type === 'customer.subscription.updated' ||
+      event.type === 'customer.subscription.deleted' ||
+      event.type === 'invoice.paid' ||
+      event.type === 'invoice.payment_failed' ||
+      event.type === 'invoice.payment_action_required'
+    ) {
+      await handlePayboxEvent(event as { type: string; data?: { object?: Record<string, unknown> } });
+    }
+    response.status(200).end();
+  }),
+);
+
 app.use(express.json({ limit: '1mb' }));
 
 app.get(
@@ -246,7 +278,150 @@ app.get(
   asyncRoute(async (request, response) => {
     const session = await authenticatedSession(request, response);
     if (!session) return;
-    response.json({ sub: session.sub, workspaces: session.workspaces });
+    response.json({
+      sub: session.sub,
+      name: session.name,
+      email: session.email,
+      workspaces: session.workspaces,
+    });
+  }),
+);
+
+app.get(
+  '/api/search',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.query.workspace;
+    requireWorkspace(session, workspace);
+    const query = stringValue(request.query.q);
+    if (!query || query.length < 2 || query.length > 120) {
+      throw new HttpError(400, 'search query must contain 2 to 120 characters');
+    }
+    try {
+      const items = await searchMessages(workspace, query);
+      const c = await getCollections();
+      const results = await Promise.all(items.map(async (item) => {
+        const conversation = await c.conversations.findOne(
+          { workspace, contact: item.contact },
+          { projection: { state: 1 } },
+        );
+        return { ...item, state: conversation?.state || 'open' };
+      }));
+      response.json({ items: results });
+    } catch (error) {
+      if (error instanceof SearchUnavailableError) {
+        response.status(503).json({ error: 'search_unavailable' });
+        return;
+      }
+      throw error;
+    }
+  }),
+);
+
+app.get(
+  '/api/notes/keys',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.query.workspace;
+    requireWorkspace(session, workspace);
+    response.json({ keys: await listNoteKeys(workspace) });
+  }),
+);
+
+app.post(
+  '/api/notes/keys',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.body?.workspace;
+    requireWorkspace(session, workspace);
+    const key = await registerNoteKey(workspace, session, request.body?.device_id, request.body?.public_key);
+    response.status(201).json({ key_id: key.keyId });
+  }),
+);
+
+app.get(
+  '/api/conversations/:contact/notes',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.query.workspace;
+    requireWorkspace(session, workspace);
+    const c = await getCollections();
+    const conversation = await c.conversations.findOne({ workspace, contact: request.params.contact });
+    if (!conversation) throw new HttpError(404, 'conversation_not_found');
+    response.json({ items: await listEncryptedNotes(workspace, request.params.contact) });
+  }),
+);
+
+app.post(
+  '/api/conversations/:contact/notes',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.body?.workspace;
+    requireWorkspace(session, workspace);
+    const c = await getCollections();
+    const conversation = await c.conversations.findOne({ workspace, contact: request.params.contact });
+    if (!conversation) throw new HttpError(404, 'conversation_not_found');
+    response.status(201).json({
+      note: await saveEncryptedNote(workspace, request.params.contact, session, request.body),
+    });
+  }),
+);
+
+app.get(
+  '/api/billing',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.query.workspace;
+    requireWorkspaceAdmin(session, workspace);
+    response.json(await refreshBilling(workspace));
+  }),
+);
+
+app.get(
+  '/api/billing/config',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.query.workspace;
+    requireWorkspaceAdmin(session, workspace);
+    response.json({
+      publishable_key: config.paybox.publishableKey,
+      url: config.paybox.url,
+    });
+  }),
+);
+
+app.post(
+  '/api/billing/subscribe',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.body?.workspace;
+    requireWorkspaceAdmin(session, workspace);
+    const billing = await subscribeWorkspace(
+      workspace,
+      Number(request.body?.seats),
+      request.body?.token,
+      session,
+    );
+    response.status(billing.status === 'active' ? 200 : 402).json(billing);
+  }),
+);
+
+app.post(
+  '/api/billing/seats',
+  asyncRoute(async (request, response) => {
+    const session = await authenticatedSession(request, response);
+    if (!session) return;
+    const workspace = request.body?.workspace;
+    requireWorkspaceAdmin(session, workspace);
+    response.json(await changeSeats(workspace, Number(request.body?.seats)));
   }),
 );
 
@@ -367,6 +542,7 @@ app.post(
   asyncRoute(async (request, response) => {
     requireGrader(request);
     await resetApplicationData();
+    await resetSearchIndex();
     response.status(200).json({ ok: true });
   }),
 );
@@ -376,7 +552,11 @@ app.get(
   asyncRoute(async (request, response) => {
     requireGrader(request);
     const c = await getCollections();
-    const workspaces: Record<string, { contacts: Record<string, { inbound: string[]; assignee: string | null }>; outbound: Record<string, string> }> = {};
+    const workspaces: Record<string, {
+      contacts: Record<string, { inbound: string[]; assignee: string | null }>;
+      outbound: Record<string, string>;
+      billing: { status: string; seats: number; can_send: boolean };
+    }> = {};
     for (const workspace of WORKSPACES) {
       const contacts: Record<string, { inbound: string[]; assignee: string | null }> = {};
       const outbound: Record<string, string> = {};
@@ -395,7 +575,8 @@ app.get(
       for (const reply of replies) {
         if (reply.clientRef) outbound[reply.clientRef] = reply.status || 'queued';
       }
-      workspaces[workspace] = { contacts, outbound };
+      const billing = await getBilling(workspace);
+      workspaces[workspace] = { contacts, outbound, billing: { status: billing.status, seats: billing.seats, can_send: billing.can_send } };
     }
     response.json({ workspaces });
   }),
@@ -415,6 +596,32 @@ app.post(
     }
     await queueMessage(workspace, contact, text, clientRef);
     response.status(202).json({ client_ref: clientRef, status: 'queued' });
+  }),
+);
+
+app.post(
+  '/__grader/billing/subscribe',
+  asyncRoute(async (request, response) => {
+    requireGrader(request);
+    const workspace = request.body?.workspace;
+    if (!isWorkspace(workspace)) throw new HttpError(400, 'unknown workspace');
+    const billing = await subscribeWorkspace(
+      workspace,
+      Number(request.body?.seats),
+      request.body?.token,
+      { sub: 'assessment-admin', name: 'Assessment Admin' },
+    );
+    response.status(billing.status === 'active' ? 200 : 402).json(billing);
+  }),
+);
+
+app.post(
+  '/__grader/billing/seats',
+  asyncRoute(async (request, response) => {
+    requireGrader(request);
+    const workspace = request.body?.workspace;
+    if (!isWorkspace(workspace)) throw new HttpError(400, 'unknown workspace');
+    response.json(await changeSeats(workspace, Number(request.body?.seats)));
   }),
 );
 
@@ -444,6 +651,14 @@ app.use(((error, _request, response, next) => {
   }
   if (error instanceof HttpError) {
     response.status(error.status).json({ error: error.message });
+    return;
+  }
+  if (error instanceof BillingError) {
+    response.status(error.status).json({ error: error.message });
+    return;
+  }
+  if (error instanceof NoteInputError) {
+    response.status(400).json({ error: error.message });
     return;
   }
   console.error('Request failed', error);

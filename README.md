@@ -48,10 +48,25 @@ To stop the containers, run `npm run down`.
 - `scaffold/server/src/realtime.ts` authenticates WebSocket connections and
   replays durable per-workspace events before delivering live notifications.
 - `scaffold/web/src/App.tsx` provides the agent sign-in and inbox experience.
+- `scaffold/server/src/billing.ts` integrates idempotent Paybox subscriptions,
+  seat changes, signed status refreshes, and send eligibility.
+- `scaffold/server/src/search.ts` provides workspace-filtered Elasticsearch
+  message search. Start the optional service with `npm run up:search`.
+- `scaffold/server/src/notes.ts` stores only encrypted note envelopes and
+  public device keys; the browser handles encryption and decryption.
 
 Each workspace's conversations and messages are stored separately by
 workspace ID. MongoDB uniqueness constraints enforce provider event,
 message, and reply idempotency across server instances.
+
+Admins can open Workspace billing in the inbox. Card details go directly from
+the browser to Paybox for tokenization; only the token reaches Switchboard.
+Use the simulator's test cards documented in `PAYBOX.md`.
+
+Private notes require at least two enrolled workspace members and out-of-band
+verification of each device-key fingerprint. Private keys remain in that
+browser's IndexedDB; losing a browser profile means those notes cannot be
+recovered. See `PROTOCOL.md` for the threat model.
 
 ## Checks
 
@@ -81,6 +96,16 @@ WebSocket connection.
 
 ## Assessment status and limitations
 
-Private notes, Elasticsearch search, and Paybox billing are not implemented.
-The public checker passes 75/75 across Levels 1, 2, 3, and 5. Level 4 is the
-private written-rules check and cannot be run from the supplied harness.
+Billing, workspace-scoped message search, and encrypted private notes are
+implemented. Billing was manually exercised with three concurrent
+subscriptions: all returned active, with one Paybox customer and no raw card
+data sent through the server. Seat-change, renewal/retry, and forged-webhook
+flows have not had a full end-to-end run. Search requires the optional
+Elasticsearch service, which was not started for the final checks. The
+encrypted-note crypto primitive has a local round-trip/recipient test, but
+browser key enrollment has not had a separate browser-level test.
+
+The checked-in public checker report is 75/75 across Levels 1, 2, 3, and 5;
+it predates these optional features. A new checker run on native Windows is
+blocked because the supplied harness spawns POSIX `sh`. Level 4 is private
+and cannot be run from the supplied harness.

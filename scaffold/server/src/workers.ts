@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { config } from './config.js';
+import { BillingError, workspaceCanSend } from './billing.js';
+import { indexMessage } from './search.js';
 import { getRedis } from './redis.js';
 import {
   appendWorkspaceEvent,
@@ -60,19 +62,27 @@ async function processInbound(event: PigeonEvent): Promise<void> {
   const c = await getCollections();
   const occurredAt = dateFrom(event.occurred_at);
   const now = new Date();
+  const inboundMessage: StoredMessage = {
+    workspace,
+    contact,
+    providerMessageId,
+    direction: 'inbound',
+    text,
+    createdAt: now,
+    occurredAt,
+  };
+  let messageToIndex = inboundMessage;
   try {
-    await c.messages.insertOne({
-      workspace,
-      contact,
-      providerMessageId,
-      direction: 'inbound',
-      text,
-      createdAt: now,
-      occurredAt,
-    });
+    await c.messages.insertOne(inboundMessage);
   } catch (error) {
     if (!isDuplicateKey(error)) throw error;
+    const stored = await c.messages.findOne({ workspace, providerMessageId });
+    if (!stored) throw error;
+    messageToIndex = stored;
   }
+  void indexMessage(messageToIndex).catch((error: unknown) => {
+    console.error('Could not index inbound message for search', error);
+  });
 
   await c.conversations.updateOne(
     { workspace, contact },
@@ -274,6 +284,10 @@ async function sendOneMessage(): Promise<boolean> {
     await finishMessage(message, 'failed');
     return true;
   }
+  if (!(await workspaceCanSend(workspace))) {
+    await deferMessage(message, 60_000, 'Workspace subscription is not active');
+    return true;
+  }
   const wait = await getRateLimitWait(workspace);
   if (wait > 0) {
     await deferMessage(message, wait);
@@ -330,23 +344,31 @@ export async function enqueueReply(
 ): Promise<void> {
   const c = await getCollections();
   const now = new Date();
+  const outboundMessage: StoredMessage = {
+    workspace,
+    contact,
+    direction: 'outbound',
+    clientRef,
+    text,
+    status: 'queued',
+    sendState: 'queued',
+    attempts: 0,
+    nextAttemptAt: now,
+    createdAt: now,
+    occurredAt: now,
+  };
+  let messageToIndex = outboundMessage;
   try {
-    await c.messages.insertOne({
-      workspace,
-      contact,
-      direction: 'outbound',
-      clientRef,
-      text,
-      status: 'queued',
-      sendState: 'queued',
-      attempts: 0,
-      nextAttemptAt: now,
-      createdAt: now,
-      occurredAt: now,
-    });
+    await c.messages.insertOne(outboundMessage);
   } catch (error) {
     if (!isDuplicateKey(error)) throw error;
+    const stored = await c.messages.findOne({ workspace, clientRef });
+    if (!stored) throw error;
+    messageToIndex = stored;
   }
+  void indexMessage(messageToIndex).catch((error: unknown) => {
+    console.error('Could not index outbound message for search', error);
+  });
   await c.conversations.updateOne(
     { workspace, contact },
     {
@@ -378,6 +400,9 @@ export async function queueMessage(
   text: string,
   clientRef?: string,
 ): Promise<string> {
+  if (!(await workspaceCanSend(workspace))) {
+    throw new BillingError(402, 'workspace subscription does not allow sending');
+  }
   const ref = clientRef || randomUUID();
   await enqueueReply(workspace, contact, text, ref);
   return ref;

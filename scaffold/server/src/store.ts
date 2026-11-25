@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Collection, Db } from 'mongodb';
 import { getDb } from './db.js';
 import { getRedis } from './redis.js';
-import type { Conversation, StoredMessage, WebhookRecord, WorkspaceEvent } from './types.js';
+import type { Conversation, EncryptedPrivateNote, StoredMessage, WebhookRecord, WorkspaceBilling, WorkspaceEvent, WorkspaceNoteKey } from './types.js';
 
 export interface Collections {
   conversations: Collection<Conversation>;
@@ -10,6 +10,9 @@ export interface Collections {
   webhooks: Collection<WebhookRecord>;
   workspaceEvents: Collection<WorkspaceEvent>;
   counters: Collection<{ _id: string; value: number }>;
+  billing: Collection<WorkspaceBilling>;
+  notes: Collection<EncryptedPrivateNote>;
+  noteKeys: Collection<WorkspaceNoteKey>;
 }
 
 let collections: Collections | undefined;
@@ -23,6 +26,9 @@ export async function getCollections(): Promise<Collections> {
       webhooks: db.collection<WebhookRecord>('webhook_events'),
       workspaceEvents: db.collection<WorkspaceEvent>('workspace_events'),
       counters: db.collection<{ _id: string; value: number }>('counters'),
+      billing: db.collection<WorkspaceBilling>('workspace_billing'),
+      notes: db.collection<EncryptedPrivateNote>('private_notes'),
+      noteKeys: db.collection<WorkspaceNoteKey>('workspace_note_keys'),
     };
   }
   return collections;
@@ -46,6 +52,9 @@ export async function ensureIndexes(): Promise<void> {
     c.webhooks.createIndex({ status: 1, leaseUntil: 1, createdAt: 1 }),
     c.workspaceEvents.createIndex({ workspace: 1, seq: 1 }, { unique: true }),
     c.workspaceEvents.createIndex({ workspace: 1, dedupeKey: 1 }, { unique: true }),
+    c.billing.createIndex({ workspace: 1 }, { unique: true }),
+    c.notes.createIndex({ workspace: 1, contact: 1, createdAt: -1 }),
+    c.noteKeys.createIndex({ workspace: 1, userId: 1, deviceId: 1 }, { unique: true }),
   ]);
 }
 
@@ -105,6 +114,9 @@ export async function resetApplicationData(): Promise<void> {
     c.webhooks.deleteMany({}),
     c.workspaceEvents.deleteMany({}),
     c.counters.deleteMany({}),
+    c.billing.deleteMany({}),
+    c.notes.deleteMany({}),
+    c.noteKeys.deleteMany({}),
   ]);
 
   const redis = getRedis();
