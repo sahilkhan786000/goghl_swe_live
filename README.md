@@ -83,6 +83,3 @@ WebSocket connection.
 Private notes, Elasticsearch search, and Paybox billing are not implemented.
 The public checker passes 75/75 across Levels 1, 2, 3, and 5. Level 4 is the
 private written-rules check and cannot be run from the supplied harness.
-
-Before submitting, export the unmodified transcript for every AI session into
-`ai-logs/`. Do not create or edit transcripts to imitate an export.
