@@ -16,6 +16,9 @@ conversation. A new customer message starts unassigned.
 
 The current scope prioritizes the assessed inbox, reliable webhooks/replies,
 and tenant isolation. Search, private notes, and billing are deliberately cut.
+Focused server tests cover malformed session cookies and workspace-claim
+allowlisting/authorization. A malformed cookie is treated as an unauthenticated
+request rather than causing an error response.
 The public checker passed 75/75: Level 1 24/24, Level 2 14/14, Level 3 22/22,
 and Level 5 15/15. Level 4 is private and was not available. Windows process
 group cleanup in the supplied checker is POSIX-specific, so the complete

@@ -57,6 +57,7 @@ message, and reply idempotency across server instances.
 
 ```sh
 npm --prefix scaffold/server run typecheck
+npm --prefix scaffold/server test
 npm --prefix scaffold/web run typecheck
 npm --prefix scaffold/web run build
 npm run check

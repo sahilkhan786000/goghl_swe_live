@@ -60,7 +60,11 @@ function cookieValue(request: { headers: { cookie?: string } }, name: string): s
   for (const part of header.split(';')) {
     const index = part.indexOf('=');
     if (index < 0 || part.slice(0, index).trim() !== name) continue;
-    return decodeURIComponent(part.slice(index + 1).trim());
+    try {
+      return decodeURIComponent(part.slice(index + 1).trim());
+    } catch {
+      return undefined;
+    }
   }
   return undefined;
 }
@@ -109,7 +113,7 @@ export async function beginLogin(request: Request, response: Response): Promise<
   response.redirect(302, authorize.toString());
 }
 
-function parseWorkspaces(value: unknown): WorkspaceAccess[] {
+export function parseWorkspaces(value: unknown): WorkspaceAccess[] {
   if (!Array.isArray(value)) throw new Error('ID token is missing workspace memberships');
   const known = new Set(['ws_acme', 'ws_globex']);
   const access: WorkspaceAccess[] = [];
