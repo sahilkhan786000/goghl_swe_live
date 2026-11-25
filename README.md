@@ -66,7 +66,10 @@ npm run check:full
 The assessment checker starts the server using `switchboard.json` and deletes
 application data during each run. Stop any manually started server first.
 The full check writes `CHECK_REPORT.json`; commit only a report produced by
-the real checker.
+the real checker. The supplied checker uses POSIX process-group kills in its
+crash test; run Levels 2 and 3 from Linux or WSL rather than native Windows.
+The checked-in report was produced using Node 22 in Linux with the supplied
+services on Docker Compose's network.
 
 ## Test users
 
@@ -75,11 +78,11 @@ agent in `ws_acme`; `u_eli` is an agent in both workspaces. Workspace access
 comes from the verified identity token and is checked on every user API and
 WebSocket connection.
 
-## Current limitations
+## Assessment status and limitations
 
 Private notes, Elasticsearch search, and Paybox billing are not implemented.
-The public level-1 checker has passed. Other assessment levels still need to
-be run and verified before submission.
+The public checker passes 75/75 across Levels 1, 2, 3, and 5. Level 4 is the
+private written-rules check and cannot be run from the supplied harness.
 
 Before submitting, export the unmodified transcript for every AI session into
 `ai-logs/`. Do not create or edit transcripts to imitate an export.
